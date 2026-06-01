@@ -77,7 +77,8 @@ async function createSession(businessId) {
             console.log(`📩 Mensaje de ${from}: ${text}`)
 
             try {
-                const response = await axios.post(`${BACKEND_URL}/api/v1/chat`, {
+                const response = await axios.post(`${BACKEND_URL}/api/v1/chat/internal`, {
+
                     business_id: businessId,
                     session_id: from,
                     message: text,

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test QR WhatsApp</title>
+    <style>
+        body { font-family: Arial; display: flex; flex-direction: column; align-items: center; padding: 40px; }
+        img { width: 300px; height: 300px; }
+        button { margin-top: 20px; padding: 10px 20px; background: #25d366; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; }
+    </style>
+</head>
+<body>
+    <h2>Conectar WhatsApp</h2>
+    <p>Escanea este QR con tu WhatsApp</p>
+    <img id="qr" src="" alt="QR Code" />
+    <p id="status">Cargando QR...</p>
+    <button onclick="loadQR()">Actualizar QR</button>
+
+    <script>
+        const BUSINESS_ID = '3f531adc-62cd-4cdd-8df2-1ab42cafdda9'
+        
+        async function loadQR() {
+            document.getElementById('status').textContent = 'Cargando QR...'
+            const res = await fetch(`https://whatsapp-service-production-6f8f.up.railway.app/session/${BUSINESS_ID}/qr`)
+            const data = await res.json()
+            
+            if (data.status === 'connected') {
+                document.getElementById('status').textContent = '✅ WhatsApp conectado!'
+                document.getElementById('qr').src = ''
+            } else if (data.qr) {
+                document.getElementById('qr').src = data.qr
+                document.getElementById('status').textContent = 'Escanea el QR con tu WhatsApp'
+            }
+        }
+
+        loadQR()
+        setInterval(loadQR, 30000) // Actualizar cada 30 segundos
+    </script>
+</body>
+</html>
