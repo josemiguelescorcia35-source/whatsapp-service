@@ -1,10 +1,9 @@
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys')
+const { default: makeWASocket, DisconnectReason, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys')
 const express = require('express')
 const cors = require('cors')
 const axios = require('axios')
 const qrcode = require('qrcode')
-const path = require('path')
-const fs = require('fs')
+const { Pool } = require('pg')
 
 const app = express()
 app.use(cors())
@@ -13,15 +12,98 @@ app.use(express.json())
 const sessions = {}
 const qrCodes = {}
 
-const BACKEND_URL = process.env.BACKEND_URL || 'https://ai-agent-backend-production-c1c0.up.railway.app'
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000'
 
-async function createSession(businessId) {
-    const sessionDir = path.join(__dirname, 'sessions', businessId)
-    if (!fs.existsSync(sessionDir)) {
-        fs.mkdirSync(sessionDir, { recursive: true })
+// Conexión a PostgreSQL
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+})
+
+// Guardar sesión en BD
+async function saveSession(businessId, data) {
+    try {
+        await pool.query(
+            `INSERT INTO whatsapp_sessions (business_id, session_data, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (business_id) 
+             DO UPDATE SET session_data = $2, updated_at = NOW()`,
+            [businessId, JSON.stringify(data, BufferJSON.replacer)]
+        )
+    } catch (err) {
+        console.error('❌ Error guardando sesión:', err.message)
+    }
+}
+
+// Cargar sesión desde BD
+async function loadSession(businessId) {
+    try {
+        const result = await pool.query(
+            'SELECT session_data FROM whatsapp_sessions WHERE business_id = $1',
+            [businessId]
+        )
+        if (result.rows.length > 0) {
+            return JSON.parse(result.rows[0].session_data, BufferJSON.reviver)
+        }
+    } catch (err) {
+        console.error('❌ Error cargando sesión:', err.message)
+    }
+    return null
+}
+
+// Eliminar sesión de BD
+async function deleteSession(businessId) {
+    try {
+        await pool.query('DELETE FROM whatsapp_sessions WHERE business_id = $1', [businessId])
+    } catch (err) {
+        console.error('❌ Error eliminando sesión:', err.message)
+    }
+}
+
+// Auth state usando PostgreSQL
+async function usePostgresAuthState(businessId) {
+    const storedData = await loadSession(businessId)
+    
+    let creds = storedData?.creds || initAuthCreds()
+    let keys = storedData?.keys || {}
+
+    const saveState = async () => {
+        await saveSession(businessId, { creds, keys })
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
+    return {
+        state: {
+            creds,
+            keys: {
+                get: async (type, ids) => {
+                    const data = {}
+                    for (const id of ids) {
+                        const value = keys[`${type}-${id}`]
+                        if (value) data[id] = value
+                    }
+                    return data
+                },
+                set: async (data) => {
+                    for (const category in data) {
+                        for (const id in data[category]) {
+                            const value = data[category][id]
+                            if (value) {
+                                keys[`${category}-${id}`] = value
+                            } else {
+                                delete keys[`${category}-${id}`]
+                            }
+                        }
+                    }
+                    await saveState()
+                }
+            }
+        },
+        saveCreds: saveState
+    }
+}
+
+async function createSession(businessId) {
+    const { state, saveCreds } = await usePostgresAuthState(businessId)
 
     const sock = makeWASocket({
         auth: state,
@@ -46,11 +128,11 @@ async function createSession(businessId) {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut
             console.log(`❌ Conexión cerrada para ${businessId}, reconectar: ${shouldReconnect}`)
             if (shouldReconnect) {
-                createSession(businessId)
+                setTimeout(() => createSession(businessId), 3000)
             } else {
                 delete sessions[businessId]
                 delete qrCodes[businessId]
-                fs.rmSync(sessionDir, { recursive: true, force: true })
+                await deleteSession(businessId)
             }
         }
 
@@ -67,9 +149,9 @@ async function createSession(businessId) {
             if (msg.key.fromMe) continue
             if (!msg.message) continue
 
-            const from = msg.key.remoteJid
-            const text = msg.message?.conversation || 
-                         msg.message?.extendedTextMessage?.text || 
+            const from = msg.key.remoteJid.replace('@s.whatsapp.net', '').replace('@lid', '')
+            const text = msg.message?.conversation ||
+                         msg.message?.extendedTextMessage?.text ||
                          ''
 
             if (!text) continue
@@ -78,7 +160,6 @@ async function createSession(businessId) {
 
             try {
                 const response = await axios.post(`${BACKEND_URL}/api/v1/chat/internal`, {
-
                     business_id: businessId,
                     session_id: from,
                     message: text,
@@ -86,7 +167,7 @@ async function createSession(businessId) {
                 })
 
                 const reply = response.data.message
-                await sock.sendMessage(from, { text: reply })
+                await sock.sendMessage(msg.key.remoteJid, { text: reply })
                 console.log(`🤖 Respuesta enviada a ${from}`)
             } catch (error) {
                 console.error('❌ Error procesando mensaje:', error.message)
@@ -97,33 +178,33 @@ async function createSession(businessId) {
     return sock
 }
 
+// Cargar sesiones existentes desde BD al iniciar
 async function loadExistingSessions() {
-    const sessionsDir = path.join(__dirname, 'sessions')
-    if (!fs.existsSync(sessionsDir)) {
-        fs.mkdirSync(sessionsDir)
-        return
-    }
-    const businessIds = fs.readdirSync(sessionsDir)
-    for (const businessId of businessIds) {
-        console.log(`🔄 Cargando sesión existente: ${businessId}`)
-        await createSession(businessId)
+    try {
+        const result = await pool.query('SELECT business_id FROM whatsapp_sessions')
+        for (const row of result.rows) {
+            console.log(`🔄 Cargando sesión: ${row.business_id}`)
+            await createSession(row.business_id)
+        }
+    } catch (err) {
+        console.error('❌ Error cargando sesiones:', err.message)
     }
 }
 
-// Iniciar sesión
+// ── ENDPOINTS ──
+
 app.get('/session/:businessId/start', async (req, res) => {
     const { businessId } = req.params
     try {
         if (!sessions[businessId]) {
             await createSession(businessId)
         }
-        res.json({ message: 'Sesión iniciada, esperando QR...' })
+        res.json({ message: 'Sesión iniciada' })
     } catch (error) {
         res.status(500).json({ error: error.message })
     }
 })
 
-// Obtener QR
 app.get('/session/:businessId/qr', async (req, res) => {
     const { businessId } = req.params
 
@@ -146,7 +227,6 @@ app.get('/session/:businessId/qr', async (req, res) => {
     }
 })
 
-// Estado de la sesión
 app.get('/session/:businessId/status', (req, res) => {
     const { businessId } = req.params
     const session = sessions[businessId]
@@ -162,18 +242,17 @@ app.get('/session/:businessId/status', (req, res) => {
     }
 })
 
-// Cerrar sesión
-app.delete('/session/:businessId', (req, res) => {
+app.delete('/session/:businessId', async (req, res) => {
     const { businessId } = req.params
     if (sessions[businessId]) {
         sessions[businessId].logout()
         delete sessions[businessId]
         delete qrCodes[businessId]
+        await deleteSession(businessId)
     }
     res.json({ message: 'Sesión cerrada ✅' })
 })
 
-// Health check
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', sessions: Object.keys(sessions).length })
 })
