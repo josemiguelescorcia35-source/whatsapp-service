@@ -43,7 +43,9 @@ async function loadSession(businessId) {
             [businessId]
         )
         if (result.rows.length > 0) {
-            return JSON.parse(result.rows[0].session_data, BufferJSON.reviver)
+            const data = result.rows[0].session_data
+            if (typeof data === 'object') return data
+            return JSON.parse(data, BufferJSON.reviver)
         }
     } catch (err) {
         console.error('❌ Error cargando sesión:', err.message)
@@ -63,7 +65,7 @@ async function deleteSession(businessId) {
 // Auth state usando PostgreSQL
 async function usePostgresAuthState(businessId) {
     const storedData = await loadSession(businessId)
-    
+
     let creds = storedData?.creds || initAuthCreds()
     let keys = storedData?.keys || {}
 
