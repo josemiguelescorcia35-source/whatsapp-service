@@ -1,9 +1,10 @@
-const { default: makeWASocket, DisconnectReason, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys')
+const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys')
 const express = require('express')
 const cors = require('cors')
 const axios = require('axios')
 const qrcode = require('qrcode')
-const { Pool } = require('pg')
+const path = require('path')
+const fs = require('fs')
 
 const app = express()
 app.use(cors())
@@ -12,105 +13,20 @@ app.use(express.json())
 const sessions = {}
 const qrCodes = {}
 
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000'
-
-// Conexión a PostgreSQL
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
-})
-
-// Guardar sesión en BD
-async function saveSession(businessId, data) {
-    try {
-        await pool.query(
-            `INSERT INTO whatsapp_sessions (business_id, session_data, updated_at)
-             VALUES ($1, $2, NOW())
-             ON CONFLICT (business_id) 
-             DO UPDATE SET session_data = $2, updated_at = NOW()`,
-            [businessId, JSON.stringify(data, BufferJSON.replacer)]
-        )
-    } catch (err) {
-        console.error('❌ Error guardando sesión:', err.message)
-    }
-}
-
-// Cargar sesión desde BD
-async function loadSession(businessId) {
-    try {
-        const result = await pool.query(
-            'SELECT session_data FROM whatsapp_sessions WHERE business_id = $1',
-            [businessId]
-        )
-        if (result.rows.length > 0) {
-            const data = result.rows[0].session_data
-            if (typeof data === 'object') return data
-            return JSON.parse(data, BufferJSON.reviver)
-        }
-    } catch (err) {
-        console.error('❌ Error cargando sesión:', err.message)
-    }
-    return null
-}
-
-// Eliminar sesión de BD
-async function deleteSession(businessId) {
-    try {
-        await pool.query('DELETE FROM whatsapp_sessions WHERE business_id = $1', [businessId])
-    } catch (err) {
-        console.error('❌ Error eliminando sesión:', err.message)
-    }
-}
-
-// Auth state usando PostgreSQL
-async function usePostgresAuthState(businessId) {
-    const storedData = await loadSession(businessId)
-
-    let creds = storedData?.creds || initAuthCreds()
-    let keys = storedData?.keys || {}
-
-    const saveState = async () => {
-        await saveSession(businessId, { creds, keys })
-    }
-
-    return {
-        state: {
-            creds,
-            keys: {
-                get: async (type, ids) => {
-                    const data = {}
-                    for (const id of ids) {
-                        const value = keys[`${type}-${id}`]
-                        if (value) data[id] = value
-                    }
-                    return data
-                },
-                set: async (data) => {
-                    for (const category in data) {
-                        for (const id in data[category]) {
-                            const value = data[category][id]
-                            if (value) {
-                                keys[`${category}-${id}`] = value
-                            } else {
-                                delete keys[`${category}-${id}`]
-                            }
-                        }
-                    }
-                    await saveState()
-                }
-            }
-        },
-        saveCreds: saveState
-    }
-}
+const BACKEND_URL = process.env.BACKEND_URL || 'https://ai-agent-backend-production-c1c0.up.railway.app'
 
 async function createSession(businessId) {
-    const { state, saveCreds } = await usePostgresAuthState(businessId)
+    const sessionDir = path.join(__dirname, 'sessions', businessId)
+    if (!fs.existsSync(sessionDir)) {
+        fs.mkdirSync(sessionDir, { recursive: true })
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir)
 
     const sock = makeWASocket({
         auth: state,
-        printQRInTerminal: false,
-        logger: require('pino')({ level: 'silent' })
+        printQRInTerminal: true, // ← cambia a true
+        logger: require('pino')({ level: 'debug' }) // ← cambia a debug
     })
 
     sessions[businessId] = sock
@@ -134,7 +50,7 @@ async function createSession(businessId) {
             } else {
                 delete sessions[businessId]
                 delete qrCodes[businessId]
-                await deleteSession(businessId)
+                fs.rmSync(sessionDir, { recursive: true, force: true })
             }
         }
 
@@ -180,20 +96,18 @@ async function createSession(businessId) {
     return sock
 }
 
-// Cargar sesiones existentes desde BD al iniciar
 async function loadExistingSessions() {
-    try {
-        const result = await pool.query('SELECT business_id FROM whatsapp_sessions')
-        for (const row of result.rows) {
-            console.log(`🔄 Cargando sesión: ${row.business_id}`)
-            await createSession(row.business_id)
-        }
-    } catch (err) {
-        console.error('❌ Error cargando sesiones:', err.message)
+    const sessionsDir = path.join(__dirname, 'sessions')
+    if (!fs.existsSync(sessionsDir)) {
+        fs.mkdirSync(sessionsDir)
+        return
+    }
+    const businessIds = fs.readdirSync(sessionsDir)
+    for (const businessId of businessIds) {
+        console.log(`🔄 Cargando sesión existente: ${businessId}`)
+        await createSession(businessId)
     }
 }
-
-// ── ENDPOINTS ──
 
 app.get('/session/:businessId/start', async (req, res) => {
     const { businessId } = req.params
@@ -250,7 +164,6 @@ app.delete('/session/:businessId', async (req, res) => {
         sessions[businessId].logout()
         delete sessions[businessId]
         delete qrCodes[businessId]
-        await deleteSession(businessId)
     }
     res.json({ message: 'Sesión cerrada ✅' })
 })
