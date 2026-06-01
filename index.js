@@ -5,6 +5,7 @@ const axios = require('axios')
 const qrcode = require('qrcode')
 const path = require('path')
 const fs = require('fs')
+const { Pool } = require('pg')
 
 const app = express()
 app.use(cors())
@@ -15,8 +16,65 @@ const qrCodes = {}
 
 const BACKEND_URL = process.env.BACKEND_URL || 'https://ai-agent-backend-production-c1c0.up.railway.app'
 
+// PostgreSQL
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+})
+
+// Guardar sesión en BD
+async function saveSessionToDB(businessId, sessionDir) {
+    try {
+        const files = fs.readdirSync(sessionDir)
+        const sessionData = {}
+        for (const file of files) {
+            const filePath = path.join(sessionDir, file)
+            const content = fs.readFileSync(filePath, 'utf8')
+            sessionData[file] = content
+        }
+        await pool.query(
+            `INSERT INTO whatsapp_sessions (business_id, session_data, updated_at)
+             VALUES ($1, $2, NOW())
+             ON CONFLICT (business_id)
+             DO UPDATE SET session_data = $2, updated_at = NOW()`,
+            [businessId, JSON.stringify(sessionData)]
+        )
+        console.log(`💾 Sesión guardada en BD: ${businessId}`)
+    } catch (err) {
+        console.error('❌ Error guardando sesión en BD:', err.message)
+    }
+}
+
+// Cargar sesión desde BD a archivos locales
+async function loadSessionFromDB(businessId, sessionDir) {
+    try {
+        const result = await pool.query(
+            'SELECT session_data FROM whatsapp_sessions WHERE business_id = $1',
+            [businessId]
+        )
+        if (result.rows.length > 0) {
+            if (!fs.existsSync(sessionDir)) {
+                fs.mkdirSync(sessionDir, { recursive: true })
+            }
+            const sessionData = result.rows[0].session_data
+            for (const [filename, content] of Object.entries(sessionData)) {
+                fs.writeFileSync(path.join(sessionDir, filename), content)
+            }
+            console.log(`📂 Sesión cargada desde BD: ${businessId}`)
+            return true
+        }
+    } catch (err) {
+        console.error('❌ Error cargando sesión desde BD:', err.message)
+    }
+    return false
+}
+
 async function createSession(businessId) {
-    const sessionDir = path.join(__dirname, 'sessions', businessId)
+    const sessionDir = path.join('/tmp/sessions', businessId)
+
+    // Intentar cargar sesión desde BD
+    await loadSessionFromDB(businessId, sessionDir)
+
     if (!fs.existsSync(sessionDir)) {
         fs.mkdirSync(sessionDir, { recursive: true })
     }
@@ -25,13 +83,16 @@ async function createSession(businessId) {
 
     const sock = makeWASocket({
         auth: state,
-        printQRInTerminal: true, // ← cambia a true
-        logger: require('pino')({ level: 'debug' }) // ← cambia a debug
+        printQRInTerminal: false,
+        logger: require('pino')({ level: 'silent' })
     })
 
     sessions[businessId] = sock
 
-    sock.ev.on('creds.update', saveCreds)
+    sock.ev.on('creds.update', async () => {
+        await saveCreds()
+        await saveSessionToDB(businessId, sessionDir)
+    })
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update
@@ -50,13 +111,14 @@ async function createSession(businessId) {
             } else {
                 delete sessions[businessId]
                 delete qrCodes[businessId]
-                fs.rmSync(sessionDir, { recursive: true, force: true })
+                await pool.query('DELETE FROM whatsapp_sessions WHERE business_id = $1', [businessId])
             }
         }
 
         if (connection === 'open') {
             console.log(`✅ WhatsApp conectado para negocio: ${businessId}`)
             delete qrCodes[businessId]
+            await saveSessionToDB(businessId, sessionDir)
         }
     })
 
@@ -97,15 +159,23 @@ async function createSession(businessId) {
 }
 
 async function loadExistingSessions() {
-    const sessionsDir = path.join(__dirname, 'sessions')
-    if (!fs.existsSync(sessionsDir)) {
-        fs.mkdirSync(sessionsDir)
-        return
-    }
-    const businessIds = fs.readdirSync(sessionsDir)
-    for (const businessId of businessIds) {
-        console.log(`🔄 Cargando sesión existente: ${businessId}`)
-        await createSession(businessId)
+    try {
+        const result = await pool.query('SELECT business_id FROM whatsapp_sessions')
+        for (const row of result.rows) {
+            console.log(`🔄 Cargando sesión desde BD: ${row.business_id}`)
+            await createSession(row.business_id)
+        }
+    } catch (err) {
+        console.error('❌ Error cargando sesiones:', err.message)
+        // Si no hay BD, cargar desde archivos locales
+        const sessionsDir = path.join('/tmp/sessions')
+        if (fs.existsSync(sessionsDir)) {
+            const businessIds = fs.readdirSync(sessionsDir)
+            for (const businessId of businessIds) {
+                console.log(`🔄 Cargando sesión local: ${businessId}`)
+                await createSession(businessId)
+            }
+        }
     }
 }
 
@@ -164,6 +234,7 @@ app.delete('/session/:businessId', async (req, res) => {
         sessions[businessId].logout()
         delete sessions[businessId]
         delete qrCodes[businessId]
+        await pool.query('DELETE FROM whatsapp_sessions WHERE business_id = $1', [businessId])
     }
     res.json({ message: 'Sesión cerrada ✅' })
 })
