@@ -243,6 +243,23 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', sessions: Object.keys(sessions).length })
 })
 
+app.post('/send-message', async (req, res) => {
+    const { business_id, phone, message } = req.body
+    try {
+        const session = sessions[business_id]
+        if (!session || !session.user) {
+            return res.status(400).json({ error: 'Sesión no conectada' })
+        }
+        const jid = `${phone}@s.whatsapp.net`
+        await session.sendMessage(jid, { text: message })
+        console.log(`📤 Mensaje enviado a ${phone}`)
+        res.json({ message: 'Mensaje enviado ✅' })
+    } catch (error) {
+        console.error('❌ Error enviando mensaje:', error.message)
+        res.status(500).json({ error: error.message })
+    }
+})
+
 const PORT = process.env.PORT || 3001
 app.listen(PORT, async () => {
     console.log(`🚀 WhatsApp Service corriendo en puerto ${PORT}`)
