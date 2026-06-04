@@ -265,3 +265,26 @@ app.listen(PORT, async () => {
     console.log(`🚀 WhatsApp Service corriendo en puerto ${PORT}`)
     await loadExistingSessions()
 })
+
+
+app.post('/send-pdf', async (req, res) => {
+    const { business_id, phone, pdf_base64, filename } = req.body
+    try {
+        const session = sessions[business_id]
+        if (!session || !session.user) {
+            return res.status(400).json({ error: 'Sesión no conectada' })
+        }
+        const jid = `${phone}@s.whatsapp.net`
+        const buffer = Buffer.from(pdf_base64, 'base64')
+        await session.sendMessage(jid, {
+            document: buffer,
+            mimetype: 'application/pdf',
+            fileName: filename || 'factura.pdf'
+        })
+        console.log(`📄 PDF enviado a ${phone}`)
+        res.json({ message: 'PDF enviado ✅' })
+    } catch (error) {
+        console.error('❌ Error enviando PDF:', error.message)
+        res.status(500).json({ error: error.message })
+    }
+})
